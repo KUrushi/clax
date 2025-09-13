@@ -3,4 +3,5 @@
   :author "KUrushi"
   :license "Specify your license here"
   :depends-on (#:cffi)
-  :components ((:file "clax")))
+  :components ((:file "package")
+               (:file "clax")))
