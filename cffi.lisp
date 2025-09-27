@@ -84,19 +84,23 @@
 
 ;; --- Helper Function ---
 (defun tensor-from-host (client device vector)
-  (let* ((dims (list (length vector)))
-         (num-dims (length dims))
+  (let* (
+         (num-dims (array-rank array))
+         (dims (array-dimensions array))
          (array-type (array-element-type vector))
          (cffi-type (cond
                       ((equal array-type 'single-float) :float)
                       ((equal array-type 'double-float) :double)
                       (t (error "Unsupported array element type: ~A" array-type)))))
     (cffi:with-foreign-objects ((dims-ptr :int64 num-dims)
-                                (data-ptr cffi-type (length vector)))
+                                (data-ptr cffi-type (array-total-size vector)))
       (loop for i from 0 for dim in dims
             do (setf (cffi:mem-aref dims-ptr :int64 i) dim))
-      (loop for i from 0 below (length vector)
-            do (setf (cffi:mem-aref data-ptr cffi-type i) (aref vector i)))
+
+      (loop for i from 0 below (array-total-size array)
+            do (setf (cffi:mem-aref data-ptr cffi-type i)
+                     (row-major-aref array i)))
+
       (let ((pjrt-type (ecase cffi-type
                          (:float :f32)
                          (:double :f64))))
