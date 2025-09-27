@@ -40,7 +40,6 @@
   (:f8e8m0fnu 28)
   (:f4e2m1fn 29))
 
-
 ;; --- C Function Definitions (FFI) ---
 (cffi:defcfun ("initialize_pjrt_api" initialize-pjrt-api) :void)
 (cffi:defcfun ("shutdown_pjrt_api" shutdown-pjrt-api) :void)
