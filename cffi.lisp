@@ -2,7 +2,7 @@
 
 ;; --- Foreign Library Definition ---
 (cffi:define-foreign-library libxla-wrapper
-  (:darwin "/Users/urushiyama.k/quicklisp/local-projects/clax/xla/bazel-bin/xla/lisp_bridge/libxla_wrapper.so")
+    (:darwin "/Users/urushiyama.k/quicklisp/local-projects/clax/xla/bazel-bin/xla/lisp_bridge/libxla_wrapper.so")
   (:unix "/Users/urushiyama.k/quicklisp/local-projects/clax/xla/bazel-bin/xla/lisp_bridge/libxla_wrapper.so")
   (:t (:default "libxla_wrapper")))
 
@@ -10,7 +10,7 @@
 
 ;; --- PJRT Data Types & Macros ---
 (cffi:defcenum pjrt-buffer-type
-  (:invalid 0)
+    (:invalid 0)
   (:pred 1)
   (:s8 2)
   (:s16 3)
@@ -65,6 +65,52 @@
   (buffer-a :pointer)
   (buffer-b :pointer))
 
+;; --- Generic Compile & Execute API ---
+(cffi:defcfun ("compile_program" %compile-program) :pointer
+  (client :pointer)
+  (mlir-string :string)
+  (mlir-length :size))
+(cffi:defcfun ("execute_program" %execute-program) :pointer
+  (executable :pointer)
+  (input-buffers :pointer)
+  (num-inputs :size))
+(cffi:defcfun ("destroy_buffer" destroy-buffer) :void
+  (buffer :pointer))
+
+;; --- High-level wrappers for generic compile/execute ---
+(defun compile-program (client mlir-string)
+  "Compiles an arbitrary StableHLO MLIR program string.
+   Returns a pointer to the compiled executable."
+  (%compile-program client mlir-string (length mlir-string)))
+
+(defun execute-program (executable input-buffers)
+  "Executes a compiled program with a list of input PJRT buffer pointers.
+   Returns the output PJRT buffer pointer."
+  (let ((num-inputs (length input-buffers)))
+    (cffi:with-foreign-object (inputs-ptr :pointer num-inputs)
+      (loop for i from 0
+            for buf in input-buffers
+            do (setf (cffi:mem-aref inputs-ptr :pointer i) buf))
+      (%execute-program executable inputs-ptr num-inputs))))
+
+(defun generate-hlo-mlir (operator shape dtype)
+  (let* ((dtype-name (string-downcase (symbol-name dtype)))
+         (op-name (string-downcase (symbol-name operator)))
+         (dim-str (format nil "~{~A~^x~}" shape))
+         (type-str (format nil "~Ax~A" dim-str dtype-name)))
+    (format nil "module @jit_fn attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+    func.func public @main(%arg0: tensor<~A>, %arg1: tensor<~A>) -> (tensor<~A>) {
+      %0 = stablehlo.~A %arg0, %arg1 : tensor<~A>
+      return %0 : tensor<~A>
+    }
+}"
+            type-str
+            type-str
+            type-str
+            op-name
+            type-str
+            type-str)))
+
 (defmacro with-pjrt-api (() &body body)
   `(progn
      (initialize-pjrt-api)
@@ -79,71 +125,123 @@
             (progn ,@body)
          (destroy-client ,client-var)))))
 
-;; --- Helper Function ---
+;; --- **MODIFIED HELPER FUNCTION** ---
 (defun tensor-from-host (client device array)
-  (let* ((num-dims (array-rank array))
-         (dims (array-dimensions array))
+  "Creates a PJRT buffer from a Common Lisp multi-dimensional array."
+  (let* ((dims (array-dimensions array))
+         (num-dims (array-rank array))
+         (total-size (array-total-size array))
          (array-type (array-element-type array))
          (cffi-type (cond
                       ((equal array-type 'single-float) :float)
                       ((equal array-type 'double-float) :double)
                       (t (error "Unsupported array element type: ~A" array-type)))))
     (cffi:with-foreign-objects ((dims-ptr :int64 num-dims)
-                                (data-ptr cffi-type (array-total-size array)))
+                                (data-ptr cffi-type total-size))
+      ;; Copy dimensions to the foreign array
       (loop for i from 0 for dim in dims
             do (setf (cffi:mem-aref dims-ptr :int64 i) dim))
-      (loop for i from 0 below (array-total-size array)
-            do (setf (cffi:mem-aref data-ptr cffi-type i)
-                     (row-major-aref array i)))
+      ;; Copy data in row-major order to the foreign array
+      (loop for i from 0 below total-size
+            do (setf (cffi:mem-aref data-ptr cffi-type i) (row-major-aref array i)))
+
       (let ((pjrt-type (ecase cffi-type
                          (:float :f32)
                          (:double :f64))))
         (create-buffer-from-host client device data-ptr dims-ptr num-dims pjrt-type)))))
 
-;; --- Main Test Execution (Corrected) ---
+;; --- **MODIFIED TEST EXECUTION** ---
 (defun test-run ()
   (with-pjrt-api ()
     (with-pjrt-client (client)
+      (format t "~&--- Compiling the 'add' function for 2x3 matrices ---~%")
       (let ((add-executable (compile-add-program client)))
         (unwind-protect
              (if (cffi:null-pointer-p add-executable)
                  (format t "~&Error: Failed to compile the program.~%")
-                 (progn
+                 (let* ((device (get-device client 0))
+                        (mat-a (make-array '(2 3) :element-type 'single-float
+                                                  :initial-contents '((10.0 20.0 30.0)
+                                                                      (40.0 50.0 60.0))))
+                        (mat-b (make-array '(2 3) :element-type 'single-float
+                                                  :initial-contents '((1.0 2.0 3.0)
+                                                                      (4.0 5.0 6.0))))
+                        (buf-a (tensor-from-host client device mat-a))
+                        (buf-b (tensor-from-host client device mat-b)))
                    (format t "Compilation successful. Executable: ~A~%" add-executable)
-                   (let ((device (get-device client 0)))
-                     (format t "~&--- Preparing Tensors (2x3 Matrices) ---~%")
-                     (let* ((mat-a (make-array '(2 3) :element-type 'single-float
-                                                     :initial-contents '((1.0 2.0 3.0) (4.0 5.0 6.0))))
-                            (mat-b (make-array '(2 3) :element-type 'single-float
-                                                     :initial-contents '((10.0 20.0 30.0) (40.0 50.0 60.0))))
-                            (buf-a (tensor-from-host client device mat-a))
-                            (buf-b (tensor-from-host client device mat-b)))
-
-                       (format t "Input Buffer A: ~A~%" buf-a)
-                       (format t "Input Buffer B: ~A~%" buf-b)
-                       (format t "~%--- Executing Add Operation ---~%")
-
-                       (let ((result-buf (execute-add add-executable buf-a buf-b)))
-                         (format t "Result Buffer: ~A~%" result-buf)
-
-                         (if (cffi:null-pointer-p result-buf)
-                             (format t "~&Execution failed.~%")
-                             (progn
-                               (format t "~%--- Copying Result to Lisp ---~%")
-                               ;; 6要素分 (2x3) のメモリを確保
-                               (cffi:with-foreign-object (result-ptr :float 6)
-                                 ;; 6要素分のデータをコピー
-                                 (buffer-to-host result-buf result-ptr (* 6 (cffi:foreign-type-size :float)))
-
-                                 ;; 結果を格納するための2x3の行列を作成
-                                 (let ((result-arr (make-array '(2 3) :element-type 'single-float)))
-                                   ;; 6回ループして、平坦化したインデックスで値をコピー
-                                   (loop for i from 0 below 6
-                                         do (setf (row-major-aref result-arr i)
-                                                  (cffi:mem-aref result-ptr :float i)))
-
-                                   (format t "Result values:~%~A~%" result-arr))))))))))
-          ;; Cleanup
+                   (format t "~&--- Preparing 2x3 Tensors ---~%")
+                   (format t "Input Buffer A: ~A~%" buf-a)
+                   (format t "Input Buffer B: ~A~%" buf-b)
+                   (format t "~%--- Executing Add Operation ---~%")
+                   (let ((result-buf (execute-add add-executable buf-a buf-b)))
+                     (format t "Result Buffer: ~A~%" result-buf)
+                     (if (cffi:null-pointer-p result-buf)
+                         (format t "~&Execution failed.~%")
+                         (progn
+                           (format t "~%--- Copying Result to Lisp ---~%")
+                           ;; The result will have 6 elements (2*3)
+                           (let ((total-size 6)
+                                 (result-dims '(2 3)))
+                             (cffi:with-foreign-object (result-ptr :float total-size)
+                               (buffer-to-host result-buf result-ptr (* total-size (cffi:foreign-type-size :float)))
+                               (let ((result-arr (make-array result-dims :element-type 'single-float)))
+                                 (loop for i from 0 below total-size
+                                       do (setf (row-major-aref result-arr i) (cffi:mem-aref result-ptr :float i)))
+                                 (format t "Result values:~%~A~%" result-arr)))))))))
+          ;; Cleanup form for the unwind-protect
           (when (and add-executable (not (cffi:null-pointer-p add-executable)))
             (format t "~&Cleaning up compiled executable...~%")
             (destroy-executable add-executable)))))))
+
+;; --- Generic API test ---
+(defun test-generic ()
+  "Tests the generic compile/execute API with add and multiply."
+  (with-pjrt-api ()
+    (with-pjrt-client (client)
+      (let* ((device (get-device client 0))
+             (shape '(2 3))
+             (mat-a (make-array shape :element-type 'single-float
+                                      :initial-contents '((10.0 20.0 30.0)
+                                                          (40.0 50.0 60.0))))
+             (mat-b (make-array shape :element-type 'single-float
+                                      :initial-contents '((1.0 2.0 3.0)
+                                                          (4.0 5.0 6.0))))
+             (buf-a (tensor-from-host client device mat-a))
+             (buf-b (tensor-from-host client device mat-b))
+             (total-size (reduce #'* shape)))
+        ;; Test add
+        (format t "~&--- Testing generic add ---~%")
+        (let* ((mlir (generate-hlo-mlir :add shape :f32))
+               (exec (compile-program client mlir)))
+          (format t "MLIR:~%~A~%~%" mlir)
+          (unwind-protect
+               (let ((result-buf (execute-program exec (list buf-a buf-b))))
+                 (cffi:with-foreign-object (result-ptr :float total-size)
+                   (buffer-to-host result-buf result-ptr
+                                   (* total-size (cffi:foreign-type-size :float)))
+                   (let ((result (make-array shape :element-type 'single-float)))
+                     (loop for i from 0 below total-size
+                           do (setf (row-major-aref result i)
+                                    (cffi:mem-aref result-ptr :float i)))
+                     (format t "A + B = ~A~%" result)))
+                 (destroy-buffer result-buf))
+            (destroy-executable exec)))
+        ;; Test multiply
+        (format t "~&--- Testing generic multiply ---~%")
+        (let* ((mlir (generate-hlo-mlir :multiply shape :f32))
+               (exec (compile-program client mlir)))
+          (unwind-protect
+               (let ((result-buf (execute-program exec (list buf-a buf-b))))
+                 (cffi:with-foreign-object (result-ptr :float total-size)
+                   (buffer-to-host result-buf result-ptr
+                                   (* total-size (cffi:foreign-type-size :float)))
+                   (let ((result (make-array shape :element-type 'single-float)))
+                     (loop for i from 0 below total-size
+                           do (setf (row-major-aref result i)
+                                    (cffi:mem-aref result-ptr :float i)))
+                     (format t "A * B = ~A~%" result)))
+                 (destroy-buffer result-buf))
+            (destroy-executable exec)))
+        ;; Cleanup input buffers
+        (destroy-buffer buf-a)
+        (destroy-buffer buf-b)))))
